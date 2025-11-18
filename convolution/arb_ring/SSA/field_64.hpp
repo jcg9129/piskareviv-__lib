@@ -1,3 +1,5 @@
+#pragma once
+
 #include <immintrin.h>
 
 #include <cassert>
@@ -10,8 +12,13 @@ namespace Field_64 {
 using u64 = uint64_t;
 using u128 = __uint128_t;
 
-u128 clmul(u64 a, u64 b) {
+__m128i clmul_vec(u64 a, u64 b) {
     __m128i tmp = _mm_clmulepi64_si128(_mm_cvtsi64_si128(a), _mm_cvtsi64_si128(b), 0);
+    return tmp;
+}
+
+u128 clmul(u64 a, u64 b) {
+    __m128i tmp = clmul_vec(a, b);
     u128 res;
     memcpy(&res, &tmp, 16);
     return res;
@@ -139,6 +146,8 @@ struct Field {
     static constexpr u64 r2 = pow(128);
 
     static_assert((u64)clmul_constexpr(u64(mod), inv) == 1);
+    
+   public:
 
     static u64 reduce(u128 val) {
         u64 f = clmul(val, inv);
@@ -146,8 +155,11 @@ struct Field {
         return val >> 64 ^ clmul(f, (u64)mod) >> 64 ^ f;
     }
 
-   private:
+   // private:
+   public:
     u64 val;
+    
+   public:
 
     __always_inline Field(u64 val, int) : val(val) { ; }
 
