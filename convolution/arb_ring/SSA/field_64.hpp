@@ -146,21 +146,19 @@ struct Field {
     static constexpr u64 r2 = pow(128);
 
     static_assert((u64)clmul_constexpr(u64(mod), inv) == 1);
-    
-   public:
 
+   public:
     static u64 reduce(u128 val) {
         u64 f = clmul(val, inv);
         // return (val ^ clmul(f, (u64)mod) ^ u128(f) << 64) >> 64;
         return val >> 64 ^ clmul(f, (u64)mod) >> 64 ^ f;
     }
 
-   // private:
+    // private:
    public:
     u64 val;
-    
-   public:
 
+   public:
     __always_inline Field(u64 val, int) : val(val) { ; }
 
    public:
@@ -176,6 +174,22 @@ struct Field {
     // Field operator*(const Field& other) const { return Field(take_mod(clmul(val, other.val), mod)); }
     Field operator*(const Field& other) const {
         return Field(reduce(clmul(val, other.val)), 0);
+    }
+
+    Field power(u64 exp) const {
+        Field r = n(1);
+        Field b = *this;
+        for (; exp; exp >>= 1) {
+            if (exp & 1) r *= b;
+            b *= b;
+        }
+        return r;
+    }
+
+    Field inverse() const {
+        Field res = power(~u64() - 1);
+        assert(res * *this == n(1));
+        return res;
     }
 
     Field& operator+=(const Field& other) { return *this = *this + other; }

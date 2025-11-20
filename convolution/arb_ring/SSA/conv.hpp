@@ -1,15 +1,17 @@
+#include <immintrin.h>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <span>
 #include <type_traits>
 #include <vector>
-#include <immintrin.h>
-
 
 #include "field_64.hpp"
 
 namespace conv {
+
+size_t total = 0;
 
 template <typename R>
 std::vector<R> convolve_naive(const std::vector<R>& a, const std::vector<R>& b) {
@@ -19,15 +21,15 @@ std::vector<R> convolve_naive(const std::vector<R>& a, const std::vector<R>& b) 
     using namespace Field_64;
     if constexpr (std::is_same_v<R, Field>) {
         size_t sz = a.size() + b.size() - 1;
-        __m128i *ptr = (__m128i*)_mm_malloc(16 * sz, 16);
+        __m128i* ptr = (__m128i*)_mm_malloc(16 * sz, 16);
         memset(ptr, 0, 16 * sz);
-        
+
         for (size_t i = 0; i < a.size(); i++) {
             for (size_t j = 0; j < b.size(); j++) {
                 ptr[i + j] ^= clmul_vec(a[i].val, b[j].val);
             }
         }
-        
+
         std::vector<R> c(sz);
         for (size_t i = 0; i < sz; i++) {
             c[i] = R(R::reduce((u128)ptr[i]), 0);
@@ -171,7 +173,7 @@ struct Meow {
     }
 
     std::vector<std::vector<K>> vec;
-    
+
     std::array<std::span<K>, 2> get(int lg) {
         while (vec.size() <= lg) {
             int k = vec.size();
@@ -182,32 +184,31 @@ struct Meow {
         return {sp.subspan(0, pow3(lg)), sp.subspan(pow3(lg))};
     }
 
-    
-    template<int lg>
+    template <int lg>
     void mul_mod_naive(std::span<K> a, std::span<K> b) {
         // std::array<K, pow3(LG)> out;
         // out.fill(K());
         constexpr size_t n = pow3(lg);
-        
+
         if constexpr (std::is_same_v<R, Field_64::Field>) {
             using namespace Field_64;
-            
+
             alignas(64) __m128i out_x[n], out_y[n];
             memset(out_x, 0, sizeof(out_x));
             memset(out_y, 0, sizeof(out_y));
-            
+
             for (size_t i = 0; i < n; i++) {
                 for (size_t j = 0; j < n; j++) {
                     auto [x1, y1] = a[i];
                     auto [x2, y2] = b[j];
-                    
+
                     __m128i xx = clmul_vec(x1.val, x2.val);
                     __m128i yy = clmul_vec(y1.val, y2.val);
                     __m128i xy = clmul_vec(x1.val, y2.val);
                     __m128i yx = clmul_vec(y1.val, x2.val);
-                    
+
                     __m128i x = xx ^ yy, y = xy ^ yx ^ yy;
-                    
+
                     if (i + j < n) {
                         out_x[i + j] ^= x, out_y[i + j] ^= y;
                     } else {
@@ -216,11 +217,11 @@ struct Meow {
                     }
                 }
             }
-            
+
             for (int i = 0; i < n; i++) {
                 a[i] = K(R(R::reduce((u128)out_x[i]), 0), R(R::reduce((u128)out_y[i]), 0));
-            }   
-        } else {        
+            }
+        } else {
             K out[n];
             std::fill(out, out + n, K());
             for (size_t i = 0; i < n; i++) {
@@ -236,8 +237,8 @@ struct Meow {
             std::copy(out, out + n, a.begin());
         }
     }
-    
-    template<int lg>
+
+    template <int lg>
     void convolve_aux(std::span<K> a, std::span<K> b) {
         // int lg = 0;
         // size_t n = 1;
@@ -257,7 +258,7 @@ struct Meow {
         size_t m = pow3(lg2);
 
         std::span<K> xa = a, xb = b;
-        //std::vector<K> ya(n), yb(n);
+        // std::vector<K> ya(n), yb(n);
         auto [ya, yb] = get(lg);
         for (size_t i = 0; i < n; i++) {
             ya[i] = a[i].conj(), yb[i] = b[i].conj();
@@ -308,9 +309,8 @@ struct Meow {
             }
         }
     }
-    
-    
-    template<int lg = 0>
+
+    template <int lg = 0>
     void convolve(std::span<K> a, std::span<K> b) {
         if (pow3(lg) == a.size()) {
             convolve_aux<lg>(a, b);
@@ -320,9 +320,7 @@ struct Meow {
             assert(false);
         }
     }
-
 };
-
 
 template <typename R>
 std::vector<R> convolve(const std::vector<R>& a, const std::vector<R>& b) {
@@ -332,11 +330,12 @@ std::vector<R> convolve(const std::vector<R>& a, const std::vector<R>& b) {
     int lg = 0;
     while (2 * pow3(lg) < a.size() + b.size() - 1) lg++;
     size_t n = pow3(lg);
-    
+
+    total += n;
     if (a.size() * b.size() <= n * lg * 10) {
         return convolve_naive(a, b);
     }
-  
+
     Meow<R> mw;
     using K = Meow<R>::K;
 
@@ -365,7 +364,7 @@ std::vector<R> convolve_transposed(const std::vector<R>& a, const std::vector<R>
         return {};
     }
     size_t d = m - n + 1;
-    
+
     if (0) {
         std::vector<R> res(d);
         for (int i = 0; i < d; i++) {
@@ -373,15 +372,15 @@ std::vector<R> convolve_transposed(const std::vector<R>& a, const std::vector<R>
             for (int j = 0; j < n; j++) {
                 r += a[j] * b[i + j];
             }
-            res[i] = r; 
+            res[i] = r;
         }
         return res;
     }
-    
+
     std::vector<R> p = convolve(std::vector<R>(a.rbegin(), a.rend()), b);
-    p.erase(p.begin(), p.begin() + (n - 1)); 
+    p.erase(p.begin(), p.begin() + (n - 1));
     p.resize(d);
-    return p; 
+    return p;
 }
 
 };  // namespace conv
