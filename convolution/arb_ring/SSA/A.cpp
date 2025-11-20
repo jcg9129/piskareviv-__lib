@@ -5,19 +5,15 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <random>
 #include <span>
 #include <type_traits>
 #include <vector>
 
 // #pragma once
-
-#include <immintrin.h>
-
-#include <cassert>
-#include <cstdint>
-#include <cstring>
-#include <random>
 
 namespace Field_64 {
 
@@ -678,7 +674,19 @@ poly operator%(const poly& a, const poly& b) {
     return divmod(a, b).second;
 }
 
+R eval(const poly& a, R pt) {
+    R res = R();
+    for (size_t i = 0; i < a.size(); i++) {
+        res = res * pt + a.rbegin()[i];
+    }
+    return res;
+}
+
 std::vector<R> evaluate_naive(const poly& a, const std::vector<R>& pts) {
+    if (pts.empty()) {
+        return {};
+    }
+
     size_t m = pts.size();
     std::vector<poly> vec(2 * m);
     for (int i = 0; i < m; i++) {
@@ -699,9 +707,12 @@ std::vector<R> evaluate_naive(const poly& a, const std::vector<R>& pts) {
 }
 
 std::vector<R> evaluate(const poly& a, const std::vector<R>& pts) {
+    if (pts.empty()) {
+        return {};
+    }
     // return evaluate_naive(a, pts);
 
-    size_t n = a.size(), m = pts.size();
+    size_t n = std::max<size_t>(a.size(), 1), m = pts.size();
     std::vector<poly> vec(2 * m);
     for (int i = 0; i < m; i++) {
         vec[m + i] = poly{R::n(1), -pts[i]};
@@ -734,7 +745,7 @@ poly interpolate(std::vector<std::pair<R, R>> pts) {
         vec[n + i] = poly{R::n(1), -pts[i].first};
     }
     for (int i = n - 1; i > 0; i--) {
-        vec[i] = vec[2 * i] * vec[2 * i + 1];
+        vec[i] = convolve(vec[2 * i], vec[2 * i + 1]);
     }
     std::vector<poly> vec2 = vec;
 
@@ -753,26 +764,22 @@ poly interpolate(std::vector<std::pair<R, R>> pts) {
         vec[2 * i + 1] = convolve_transposed(vec2[2 * i], vec[i]);
     }
 
-    for (int i = 1; i < 2 * n; i++) {
-        std::reverse(vec2[i].begin(), vec2[i].end());
-    }
-
     for (int i = 0; i < n; i++) {
         R f = coeff(vec[n + i], 0);
         vec[n + i] = poly{f.inverse() * pts[i].second};
+    }
+    for (int i = 1; i < 2 * n; i++) {
+        std::reverse(vec2[i].begin(), vec2[i].end());
     }
     for (int i = n - 1; i > 0; i--) {
         vec[i] = vec[2 * i] * vec2[2 * i + 1] + vec[2 * i + 1] * vec2[2 * i];
     }
 
-    return vec[1];
-}
-
-R eval(const poly& a, R pt) {
-    R res = R();
-    for (size_t i = 0; i < a.size(); i++) {
-        res = res * pt + a.rbegin()[i];
-    }
+    poly res = std::move(vec[1]);
+    // for (auto [x, y] : pts) {
+    //     std::cerr << eval(res, x).get() << " " << y.get() << "\n";
+    //     assert(eval(res, x) == y);
+    // }
     return res;
 }
 
@@ -796,6 +803,22 @@ void test_eval() {
         int ind = rnd() % pts.size();
         assert(vals[ind] == meow::eval(p, pts[ind]));
     }
+
+    if (1) {
+        for (int i = 0; i < 10; i++) {
+            poly p(rnd() % n);
+            std::vector<R> pts(rnd() % n + 1);
+            for (auto& i : p) i = R(rnd());
+            for (auto& i : pts) i = R(rnd());
+
+            std::vector<R> vals = meow::evaluate(p, pts);
+
+            for (int i = 0; i < 10; i++) {
+                int ind = rnd() % pts.size();
+                assert(vals[ind] == meow::eval(p, pts[ind]));
+            }
+        }
+    }
 }
 
 void test_interpolate() {
@@ -812,11 +835,22 @@ void test_interpolate() {
         int ind = rnd() % n;
         assert(meow::eval(p, pts[ind].first) == pts[ind].second);
     }
+    std::vector<R> x(n);
+    for (int i = 0; i < n; i++) {
+        x[i] = pts[i].first;
+    }
+
+    std::vector<R> vals = meow::evaluate(p, x);
+    for (int i = 0; i < n; i++) {
+        assert(vals[i] == pts[i].second);
+    }
 }
 
 #include <set>
 
 int main() {
+    // freopen("cum.in", "r", stdin);
+
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
@@ -855,8 +889,8 @@ int main() {
             std::cout << p[i].get() << "\n\n"[i + 1 == p.size()];
         }
     } else {
-        std::vector<R> input(n);
-        for (auto& r : input) {
+        poly p(n);
+        for (auto& r : p) {
             uint64_t val;
             std::cin >> val;
             r = R(val);
@@ -871,7 +905,7 @@ int main() {
             r = R(val);
         }
 
-        std::vector<R> res = meow::evaluate(input, pts);
+        std::vector<R> res = meow::evaluate(p, pts);
 
         for (int i = 0; i < res.size(); i++) {
             std::cout << res[i].get() << "\n\n"[i + 1 == res.size()];
