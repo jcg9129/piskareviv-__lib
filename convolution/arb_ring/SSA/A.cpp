@@ -788,10 +788,6 @@ poly interpolate(std::vector<std::pair<R, R>> pts) {
     return res;
 }
 
-};  // namespace meow
-
-using meow::R, meow::poly;
-
 void test_eval() {
     std::mt19937_64 rnd;
 
@@ -850,6 +846,11 @@ void test_interpolate() {
     //     assert(vals[i] == pts[i].second);
     // }
 }
+
+};  // namespace meow
+
+using meow::R, meow::poly;
+using meow::test_eval, meow::test_interpolate;
 
 #include <set>
 

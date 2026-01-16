@@ -28,7 +28,6 @@ int32_t main(int argc, char** argv) {
     // for (int i = 0; i < n; i++) {
     //     qin >> b[i];
     // }
-
     Cum cum(998'244'353);
 
     for (int i = 0; i < cnt; i++)

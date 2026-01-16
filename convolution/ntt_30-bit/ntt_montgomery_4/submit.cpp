@@ -647,6 +647,7 @@ struct NTT {
 
     static constexpr int MUL_HIGH_RADIX = 16;
     static constexpr int MUL_ITER = 10;
+    static constexpr int PG_SZ = 10, HRD_RD = 6;
     static constexpr int MUL_QUAD = 4;
 
     template <int X, int lg, bool mul_by_fc = true>
@@ -805,119 +806,128 @@ struct NTT {
     }
 
     template <bool first = true>
-    __attribute__((optimize("O3"))) void ntt_mul_rec_aux(int lg, int ind, u32 *data_a, u32 *data_b, Cum_info &cum_info, u32 fc) const {
+    [[gnu::noinline]] __attribute__((optimize("O3"))) void ntt_mul_aux_iter(int lg, int ind, int shf, u32 *data_a, u32 *data_b, Cum_info &cum_info, u32 fc) const {
+        const auto mts = this->mts;  // ! to put Montgomery constants in registers
+        const auto mt = this->mt;
+
+        assert(lg <= MUL_ITER);
+        int k = lg;
+
+        for (; k > MUL_QUAD; k -= 2) {
+            u32x8 w_1 = set1_u32x8(w[1]);
+            u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
+
+            u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[k];
+
+            for (int i = 0; i < (1 << lg); i += (1 << k)) {
+                u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
+                u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
+                u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
+
+                u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
+                u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
+                u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
+
+                wj_cum = mts.mul<true>(wj_cum, w_cum_x4[__builtin_ctz(~(ind + i >> k))]);
+
+                for (auto data : std::array{data_a, data_b}) {
+                    for (int j = 0; j < (1 << k - 2); j += 8) {
+                        std::array<u32 *, 4> dt = {data + i + 0 * (1 << k - 2) + j,
+                                                   data + i + 1 * (1 << k - 2) + j,
+                                                   data + i + 2 * (1 << k - 2) + j,
+                                                   data + i + 3 * (1 << k - 2) + j};
+
+                        if (first && i == 0) {
+                            butterfly_forward_x4<true, true>(dt[0], dt[1], dt[2], dt[3],
+                                                             w_1, w1, w2, w3, mts,
+                                                             w_1_h, w1_h, w2_h, w3_h);
+                            continue;
+                        }
+                        butterfly_forward_x4<false, true>(dt[0], dt[1], dt[2], dt[3],
+                                                          w_1, w1, w2, w3, mts,
+                                                          w_1_h, w1_h, w2_h, w3_h);
+                    }
+                }
+                if (k - 2 <= MUL_QUAD) {
+                    u32 f0 = w1[0];
+                    u32 f1 = mt.mul<true>(f0, w[1]);
+
+                    std::array<u32, 4> wi = {f0, mod - f0, f1, mod - f1};
+                    mul_mod_x4<false>(k - 2, data_a + i, data_b + i, wi, fc, mts);
+                }
+            }
+            cum_info.w_cum[k] = wj_cum;
+        }
+
+        fc = mt.mul<true>(fc, mt.r2);
+        u32x8 fc_x8 = set1_u32x8(fc);
+        u32x8 fc_x8_h = mul64_u32x8(fc_x8, mts.n_inv);
+
+        for (; k + 1 < lg; k += 2) {
+            u64x4 wj_cum = cum_info.w_cum_r[k];
+            if (first) {
+                wj_cum = (u64x4)mts.r;
+                if (k <= MUL_QUAD) {
+                    wj_cum = (u64x4)fc_x8;
+                }
+            }
+            u32x8 w_1 = set1_u32x8(w_r[1]);
+
+            for (int i = 0; i < (1 << lg); i += (1 << k + 2)) {
+                u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
+                u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
+                u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
+
+                wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind + i >> k + 2))]);
+
+                for (int j = 0; j < (1 << k); j += 8) {
+                    std::array<u32 *, 4> dt = {data_a + i + 0 * (1 << k) + j,
+                                               data_a + i + 1 * (1 << k) + j,
+                                               data_a + i + 2 * (1 << k) + j,
+                                               data_a + i + 3 * (1 << k) + j};
+
+                    if (k <= MUL_QUAD) {
+                        if (first && i == 0) {
+                            butterfly_inverse_x4<true, true, 0>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts, fc_x8);
+                            continue;
+                        }
+                        butterfly_inverse_x4<false, true>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts, fc_x8);
+                        continue;
+                    }
+                    if (first && i == 0) {
+                        butterfly_inverse_x4<true>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts);
+                        continue;
+                    }
+                    butterfly_inverse_x4(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts);
+                    continue;
+                }
+            }
+            cum_info.w_cum_r[k] = wj_cum;
+        }
+    }
+
+    template <bool first = true>
+    [[gnu::noinline]] __attribute__((optimize("O3"))) void ntt_mul_rec_aux(int lg, int ind, int shf, u32 *data_a, u32 *data_b, Cum_info &cum_info, u32 fc) const {
         const auto mts = this->mts;  // ! to put Montgomery constants in registers
         const auto mt = this->mt;
 
         if (lg <= MUL_ITER) {
-            // return;
-            int k = lg;
-
-            for (; k > MUL_QUAD; k -= 2) {
-                u32x8 w_1 = set1_u32x8(w[1]);
-                u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
-
-                u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[k];
-
-                for (int i = 0; i < (1 << lg); i += (1 << k)) {
-                    u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
-                    u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
-                    u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
-
-                    u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
-                    u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
-                    u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
-
-                    wj_cum = mts.mul<true>(wj_cum, w_cum_x4[__builtin_ctz(~(ind + i >> k))]);
-
-                    for (auto data : std::array{data_a, data_b}) {
-                        for (int j = 0; j < (1 << k - 2); j += 8) {
-                            std::array<u32 *, 4> dt = {data + i + 0 * (1 << k - 2) + j,
-                                                       data + i + 1 * (1 << k - 2) + j,
-                                                       data + i + 2 * (1 << k - 2) + j,
-                                                       data + i + 3 * (1 << k - 2) + j};
-
-                            if (first && i == 0) {
-                                butterfly_forward_x4<true, true>(dt[0], dt[1], dt[2], dt[3],
-                                                                 w_1, w1, w2, w3, mts,
-                                                                 w_1_h, w1_h, w2_h, w3_h);
-                                continue;
-                            }
-                            butterfly_forward_x4<false, true>(dt[0], dt[1], dt[2], dt[3],
-                                                              w_1, w1, w2, w3, mts,
-                                                              w_1_h, w1_h, w2_h, w3_h);
-                        }
-                    }
-                    if (k - 2 <= MUL_QUAD) {
-                        u32 f0 = w1[0];
-                        u32 f1 = mt.mul<true>(f0, w[1]);
-
-                        std::array<u32, 4> wi = {f0, mod - f0, f1, mod - f1};
-                        mul_mod_x4<false>(k - 2, data_a + i, data_b + i, wi, fc, mts);
-                    }
-                }
-                cum_info.w_cum[k] = wj_cum;
-            }
-
-            fc = mt.mul<true>(fc, mt.r2);
-            u32x8 fc_x8 = set1_u32x8(fc);
-            u32x8 fc_x8_h = mul64_u32x8(fc_x8, mts.n_inv);
-
-            for (; k + 1 < lg; k += 2) {
-                u64x4 wj_cum = cum_info.w_cum_r[k];
-                if (first) {
-                    wj_cum = (u64x4)mts.r;
-                    if (k <= MUL_QUAD) {
-                        wj_cum = (u64x4)fc_x8;
-                    }
-                }
-                u32x8 w_1 = set1_u32x8(w_r[1]);
-
-                for (int i = 0; i < (1 << lg); i += (1 << k + 2)) {
-                    u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
-                    u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
-                    u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
-
-                    wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind + i >> k + 2))]);
-
-                    for (int j = 0; j < (1 << k); j += 8) {
-                        std::array<u32 *, 4> dt = {data_a + i + 0 * (1 << k) + j,
-                                                   data_a + i + 1 * (1 << k) + j,
-                                                   data_a + i + 2 * (1 << k) + j,
-                                                   data_a + i + 3 * (1 << k) + j};
-
-                        if (k <= MUL_QUAD) {
-                            if (first && i == 0) {
-                                butterfly_inverse_x4<true, true, 0>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts, fc_x8);
-                                continue;
-                            }
-                            butterfly_inverse_x4<false, true>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts, fc_x8);
-                            continue;
-                        }
-                        if (first && i == 0) {
-                            butterfly_inverse_x4<true>(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts);
-                            continue;
-                        }
-                        butterfly_inverse_x4(dt[0], dt[1], dt[2], dt[3], w_1, w1, w2, w3, mts);
-                        continue;
-                    }
-                }
-                cum_info.w_cum_r[k] = wj_cum;
-            }
+            ntt_mul_aux_iter<first>(lg, ind, shf, data_a, data_b, cum_info, fc);
             return;
         }
 
         auto recurse = [&](auto RD) {
-            ntt_mul_rec_aux<first>(lg - RD, ind, data_a, data_b, cum_info, fc);
+            ntt_mul_rec_aux<first>(lg - RD, ind, shf, data_a, data_b, cum_info, fc);
             for (int i = 1; i < (1 << RD); i++) {
                 ntt_mul_rec_aux<false>(lg - RD, ind + (1 << lg - RD) * i,
+                                       shf + i,
                                        data_a + (1 << lg - RD) * i,
                                        data_b + (1 << lg - RD) * i,
                                        cum_info, fc);
             }
         };
 
-        if (lg < MUL_HIGH_RADIX || 1) {
+        if (lg < MUL_HIGH_RADIX || 0) {
             {
                 int k = lg;
                 u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[k];
@@ -959,10 +969,10 @@ struct NTT {
                 u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
                 u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
 
-                // u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
-                // u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
-                // u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
-                // u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
+                u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
+                u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
+                u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
+                u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
 
                 wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind >> k))]);
 
@@ -972,19 +982,12 @@ struct NTT {
                                                 data_a + 2 * (1 << k - 2) + j,
                                                 data_a + 3 * (1 << k - 2) + j,
                                                 w_1, w1, w2, w3, mts);
-                    // continue;
-                    // butterfly_inverse_x4<first, false, true>(data_a + 0 * (1 << k - 2) + j,
-                    //                                          data_a + 1 * (1 << k - 2) + j,
-                    //                                          data_a + 2 * (1 << k - 2) + j,
-                    //                                          data_a + 3 * (1 << k - 2) + j,
-                    //                                          w_1, w1, w2, w3, mts, u32x8(),
-                    //                                          w_1_h, w1_h, w2_h, w3_h);
                 }
 
                 cum_info.w_cum_r[k] = wj_cum;
             }
         } else {
-            constexpr int RD = 6;
+            constexpr int RD = HRD_RD;
             constexpr int BLC = 1024;
             {
                 u32x8 w_1 = set1_u32x8(w[1]);
@@ -1124,7 +1127,7 @@ struct NTT {
 
         Cum_info cum_info;
         u32 f = power(mt.mul(mt.r2, mod + 1 >> 1), (lg - (MUL_QUAD - 1)) / 2 * 2);
-        ntt_mul_rec_aux(lg, 0, a, b, cum_info, f);
+        ntt_mul_rec_aux(lg, 0, 0, a, b, cum_info, f);
     }
 
     __attribute__((optimize("O3"))) std::vector<u32> convolve_slow(std::vector<u32> a, std::vector<u32> b) const {

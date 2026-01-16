@@ -340,6 +340,7 @@ struct NTT {
     static constexpr int MUL_HIGH_RADIX = 16;
     static constexpr int MUL_ITER = 10;
     static constexpr int PG_SZ = 10, HRD_RD = 6;
+    static constexpr int BLC_SZ = 64, BLC_CNT = 16;  // * cyclyc shift according to 4 higher bits of 6-bit index
     static constexpr int MUL_QUAD = 4;
 
     template <int X, int lg, bool mul_by_fc = true>
@@ -497,10 +498,24 @@ struct NTT {
         }
     }
 
+    static int get_cum_shift(int ind, int shf) {
+        shf &= BLC_CNT - 1;
+        static constexpr int mask = (1 << PG_SZ) - 1;
+        return (ind & ~mask) | ((ind + BLC_SZ * shf) & mask);
+    }
+
     template <bool first = true>
     [[gnu::noinline]] __attribute__((optimize("O3"))) void ntt_mul_aux_iter(int lg, int ind, int shf, u32 *data_a, u32 *data_b, Cum_info &cum_info, u32 fc) const {
         const auto mts = this->mts;  // ! to put Montgomery constants in registers
         const auto mt = this->mt;
+
+        shf &= (BLC_CNT - 1);
+
+        auto get_ind = [&](int i) {
+            // return i;
+            int res = get_cum_shift(ind + i, shf) - ind;
+            return res;
+        };
 
         assert(lg <= MUL_ITER);
         int k = lg;
@@ -524,10 +539,10 @@ struct NTT {
 
                 for (auto data : std::array{data_a, data_b}) {
                     for (int j = 0; j < (1 << k - 2); j += 8) {
-                        std::array<u32 *, 4> dt = {data + i + 0 * (1 << k - 2) + j,
-                                                   data + i + 1 * (1 << k - 2) + j,
-                                                   data + i + 2 * (1 << k - 2) + j,
-                                                   data + i + 3 * (1 << k - 2) + j};
+                        std::array<u32 *, 4> dt = {data + get_ind(i + 0 * (1 << k - 2) + j),
+                                                   data + get_ind(i + 1 * (1 << k - 2) + j),
+                                                   data + get_ind(i + 2 * (1 << k - 2) + j),
+                                                   data + get_ind(i + 3 * (1 << k - 2) + j)};
 
                         if (first && i == 0) {
                             butterfly_forward_x4<true, true>(dt[0], dt[1], dt[2], dt[3],
@@ -545,7 +560,7 @@ struct NTT {
                     u32 f1 = mt.mul<true>(f0, w[1]);
 
                     std::array<u32, 4> wi = {f0, mod - f0, f1, mod - f1};
-                    mul_mod_x4<false>(k - 2, data_a + i, data_b + i, wi, fc, mts);
+                    mul_mod_x4<false>(k - 2, data_a + get_ind(i), data_b + get_ind(i), wi, fc, mts);
                 }
             }
             cum_info.w_cum[k] = wj_cum;
@@ -573,10 +588,10 @@ struct NTT {
                 wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind + i >> k + 2))]);
 
                 for (int j = 0; j < (1 << k); j += 8) {
-                    std::array<u32 *, 4> dt = {data_a + i + 0 * (1 << k) + j,
-                                               data_a + i + 1 * (1 << k) + j,
-                                               data_a + i + 2 * (1 << k) + j,
-                                               data_a + i + 3 * (1 << k) + j};
+                    std::array<u32 *, 4> dt = {data_a + get_ind(i + 0 * (1 << k) + j),
+                                               data_a + get_ind(i + 1 * (1 << k) + j),
+                                               data_a + get_ind(i + 2 * (1 << k) + j),
+                                               data_a + get_ind(i + 3 * (1 << k) + j)};
 
                     if (k <= MUL_QUAD) {
                         if (first && i == 0) {
@@ -608,18 +623,80 @@ struct NTT {
             return;
         }
 
-        auto recurse = [&](auto RD) {
+        auto recurse = [&](auto RD, auto get_shf) {
             ntt_mul_rec_aux<first>(lg - RD, ind, shf, data_a, data_b, cum_info, fc);
             for (int i = 1; i < (1 << RD); i++) {
                 ntt_mul_rec_aux<false>(lg - RD, ind + (1 << lg - RD) * i,
-                                       shf + i,
+                                       (shf + get_shf(i)) & (BLC_CNT - 1),
                                        data_a + (1 << lg - RD) * i,
                                        data_b + (1 << lg - RD) * i,
                                        cum_info, fc);
             }
         };
 
-        if (lg < MUL_HIGH_RADIX || 1) {
+        if (lg < MUL_HIGH_RADIX) {
+            shf &= (BLC_CNT - 1);
+            if (lg - 2 >= MUL_ITER) {
+                {
+                    int k = lg;
+                    u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[k];
+
+                    u32x8 w_1 = set1_u32x8(w[1]);
+                    u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
+                    u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
+                    u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
+
+                    u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
+                    u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
+                    u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
+                    u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
+
+                    wj_cum = mts.mul<true>(wj_cum, w_cum_x4[__builtin_ctz(~(ind >> k))]);
+
+                    for (auto data : std::array{data_a, data_b}) {
+                        for (int j = 0; j < (1 << k - 2); j += 8) {
+                            butterfly_forward_x4<first, true>(data + 0 * (1 << k - 2) + j,
+                                                              data + 1 * (1 << k - 2) + j,
+                                                              data + 2 * (1 << k - 2) + j,
+                                                              data + 3 * (1 << k - 2) + j,
+                                                              w_1, w1, w2, w3, mts,
+                                                              w_1_h, w1_h, w2_h, w3_h);
+                        }
+                    }
+
+                    cum_info.w_cum[k] = wj_cum;
+                }
+
+                recurse(std::integral_constant<int64_t, 2>(), [&](int i) { return 0; });
+
+                {
+                    int k = lg;
+                    u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum_r[k];
+
+                    u32x8 w_1 = set1_u32x8(w_r[1]);
+                    u32x8 w1 = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
+                    u32x8 w2 = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
+                    u32x8 w3 = permute_u32x8((u32x8)wj_cum, set1_u32x8(6));
+
+                    u32x8 w_1_h = mul64_u32x8(w_1, mts.n_inv);
+                    u32x8 w1_h = mul64_u32x8(w1, mts.n_inv);
+                    u32x8 w2_h = mul64_u32x8(w2, mts.n_inv);
+                    u32x8 w3_h = mul64_u32x8(w3, mts.n_inv);
+
+                    wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind >> k))]);
+
+                    for (int j = 0; j < (1 << k - 2); j += 8) {
+                        butterfly_inverse_x4<first>(data_a + 0 * (1 << k - 2) + j,
+                                                    data_a + 1 * (1 << k - 2) + j,
+                                                    data_a + 2 * (1 << k - 2) + j,
+                                                    data_a + 3 * (1 << k - 2) + j,
+                                                    w_1, w1, w2, w3, mts);
+                    }
+
+                    cum_info.w_cum_r[k] = wj_cum;
+                }
+                return;
+            }
             {
                 int k = lg;
                 u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[k];
@@ -637,20 +714,22 @@ struct NTT {
                 wj_cum = mts.mul<true>(wj_cum, w_cum_x4[__builtin_ctz(~(ind >> k))]);
 
                 for (auto data : std::array{data_a, data_b}) {
-                    for (int j = 0; j < (1 << k - 2); j += 8) {
-                        butterfly_forward_x4<first, true>(data + 0 * (1 << k - 2) + j,
-                                                          data + 1 * (1 << k - 2) + j,
-                                                          data + 2 * (1 << k - 2) + j,
-                                                          data + 3 * (1 << k - 2) + j,
-                                                          w_1, w1, w2, w3, mts,
-                                                          w_1_h, w1_h, w2_h, w3_h);
+                    for (int j = 0; j < (1 << k - 2); j += BLC_SZ) {
+                        for (int j0 = 0; j0 < BLC_SZ; j0 += 8) {
+                            butterfly_forward_x4<first, true>(data + get_cum_shift(0 * (1 << k - 2) + j, shf) + j0,
+                                                              data + get_cum_shift(1 * (1 << k - 2) + j, shf) + j0,
+                                                              data + get_cum_shift(2 * (1 << k - 2) + j, shf) + j0,
+                                                              data + get_cum_shift(3 * (1 << k - 2) + j, shf) + j0,
+                                                              w_1, w1, w2, w3, mts,
+                                                              w_1_h, w1_h, w2_h, w3_h);
+                        }
                     }
                 }
 
                 cum_info.w_cum[k] = wj_cum;
             }
 
-            recurse(std::integral_constant<int64_t, 2>());
+            recurse(std::integral_constant<int64_t, 2>(), [&](int i) { return 0; });
 
             {
                 int k = lg;
@@ -668,19 +747,21 @@ struct NTT {
 
                 wj_cum = mts.mul<true>(wj_cum, w_rcum_x4[__builtin_ctz(~(ind >> k))]);
 
-                for (int j = 0; j < (1 << k - 2); j += 8) {
-                    butterfly_inverse_x4<first>(data_a + 0 * (1 << k - 2) + j,
-                                                data_a + 1 * (1 << k - 2) + j,
-                                                data_a + 2 * (1 << k - 2) + j,
-                                                data_a + 3 * (1 << k - 2) + j,
-                                                w_1, w1, w2, w3, mts);
+                for (int j = 0; j < (1 << k - 2); j += BLC_SZ) {
+                    for (int j0 = 0; j0 < BLC_SZ; j0 += 8) {
+                        butterfly_inverse_x4<first>(data_a + get_cum_shift(0 * (1 << k - 2) + j, shf) + j0,
+                                                    data_a + get_cum_shift(1 * (1 << k - 2) + j, shf) + j0,
+                                                    data_a + get_cum_shift(2 * (1 << k - 2) + j, shf) + j0,
+                                                    data_a + get_cum_shift(3 * (1 << k - 2) + j, shf) + j0,
+                                                    w_1, w1, w2, w3, mts);
+                    }
                 }
 
                 cum_info.w_cum_r[k] = wj_cum;
             }
         } else {
             constexpr int RD = HRD_RD;
-            constexpr int BLC = 1024;
+            constexpr int BLC = 64;
             {
                 u32x8 w_1 = set1_u32x8(w[1]);
                 alignas(64) u32x8 wx_0[3];
@@ -689,7 +770,8 @@ struct NTT {
                 for (int t = 0; t < 3; t++) {
                     u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum[lg - 2 * t];
                     for (int i = 0; i < (1 << 2 * t); i++) {
-                        u32x8 *wi = std::array{wx_0, wx_1[i], wx_2[i]}[t];
+                        // u32x8 *wi = std::array{wx_0, wx_1[i], wx_2[i]}[t];
+                        u32x8 *wi = t == 0 ? wx_0 : (t == 1 ? wx_1[i] : wx_2[i]);
 
                         wi[0] = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
                         wi[1] = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
@@ -706,17 +788,26 @@ struct NTT {
                             const int sz_it = 1 << lg - 2 * t - 2;
 
                             for (int i = 0, i0 = 0; i < (1 << lg); i += 4 * sz_it, i0++) {
-                                u32x8 *wi = std::array{wx_0, wx_1[i0], wx_2[i0]}[t];
+                                // u32x8 *wi = std::array{wx_0, wx_1[i0], wx_2[i0]}[t];
+                                u32x8 *wi = t == 0 ? wx_0 : (t == 1 ? wx_1[i0] : wx_2[i0]);
                                 u32x8 w1 = wi[0], w2 = wi[1], w3 = wi[2];
                                 for (int j1 = j0, j2 = 0; j1 < sz_it; j1 += sz, j2++) {
-                                    for (int j = j1; j < j1 + BLC; j += 8) {
-                                        std::array<u32 *, 4> dt = {data + i + 0 * sz_it + j, data + i + 1 * sz_it + j,
-                                                                   data + i + 2 * sz_it + j, data + i + 3 * sz_it + j};
+                                    const int base = (i0 << 2 + 2 * (2 - t));
+                                    const int scale = 1 << 2 * (2 - t);
+                                    std::array<int, 4> cum_ind = {base + j2 + scale * 0,
+                                                                  base + j2 + scale * 1,
+                                                                  base + j2 + scale * 2,
+                                                                  base + j2 + scale * 3};
+                                    std::array<u32 *, 4> dt = {data + get_cum_shift(i + 0 * sz_it + j1, (cum_ind[0] >> 2) + shf),
+                                                               data + get_cum_shift(i + 1 * sz_it + j1, (cum_ind[1] >> 2) + shf),
+                                                               data + get_cum_shift(i + 2 * sz_it + j1, (cum_ind[2] >> 2) + shf),
+                                                               data + get_cum_shift(i + 3 * sz_it + j1, (cum_ind[3] >> 2) + shf)};
+                                    for (int j = 0; j < BLC; j += 8) {
                                         if (first && i == 0) {
-                                            butterfly_forward_x4<true>(dt[0], dt[1], dt[2], dt[3],
+                                            butterfly_forward_x4<true>(dt[0] + j, dt[1] + j, dt[2] + j, dt[3] + j,
                                                                        w_1, w1, w2, w3, mts);
                                         } else {
-                                            butterfly_forward_x4(dt[0], dt[1], dt[2], dt[3],
+                                            butterfly_forward_x4(dt[0] + j, dt[1] + j, dt[2] + j, dt[3] + j,
                                                                  w_1, w1, w2, w3, mts);
                                         }
                                     }
@@ -727,7 +818,7 @@ struct NTT {
                 }
             }
 
-            recurse(std::integral_constant<int64_t, 6>());
+            recurse(std::integral_constant<int64_t, 6>(), [&](int i) { return i >> 2; });
 
             {
                 u32x8 w_1 = set1_u32x8(w_r[1]);
@@ -737,7 +828,8 @@ struct NTT {
                 for (int t = 0; t < 3; t++) {
                     u64x4 wj_cum = first ? (u64x4)mts.r : cum_info.w_cum_r[lg - 2 * t];
                     for (int i = 0; i < (1 << 2 * t); i++) {
-                        u32x8 *wi = std::array{wx_0, wx_1[i], wx_2[i]}[t];
+                        // u32x8 *wi = std::array{wx_0, wx_1[i], wx_2[i]}[t];
+                        u32x8 *wi = t == 0 ? wx_0 : (t == 1 ? wx_1[i] : wx_2[i]);
 
                         wi[0] = shuffle_u32x8<0b00'00'00'00>((u32x8)wj_cum);
                         wi[1] = permute_u32x8((u32x8)wj_cum, set1_u32x8(2));
@@ -746,24 +838,34 @@ struct NTT {
                     }
                     cum_info.w_cum_r[lg - 2 * t] = wj_cum;
                 }
+
                 const int sz = 1 << lg - 6;
                 for (int j0 = 0; j0 < sz; j0 += BLC) {
                     for (int t = 2; t >= 0; t--) {
                         const int sz_it = 1 << lg - 2 * t - 2;
-                        const int sz_bf = BLC << RD - 2 * t - 2;
 
                         for (int i = 0, i0 = 0; i < (1 << lg); i += 4 * sz_it, i0++) {
-                            u32x8 *wi = std::array{wx_0, wx_1[i0], wx_2[i0]}[t];
+                            // u32x8 *wi = std::array{wx_0, wx_1[i0], wx_2[i0]}[t];
+                            u32x8 *wi = t == 0 ? wx_0 : (t == 1 ? wx_1[i0] : wx_2[i0]);
                             u32x8 w1 = wi[0], w2 = wi[1], w3 = wi[2];
-                            for (int j1 = j0; j1 < sz_it; j1 += sz) {
-                                for (int j = j1; j < j1 + BLC; j += 8) {
-                                    std::array<u32 *, 4> dt = {data_a + i + 0 * sz_it + j, data_a + i + 1 * sz_it + j,
-                                                               data_a + i + 2 * sz_it + j, data_a + i + 3 * sz_it + j};
+
+                            for (int j1 = j0, j2 = 0; j1 < sz_it; j1 += sz, j2++) {
+                                const int base = i0 << 2 + 2 * (2 - t);
+                                const int scale = 1 << 2 * (2 - t);
+                                std::array<int, 4> cum_ind = {base + j2 + scale * 0,
+                                                              base + j2 + scale * 1,
+                                                              base + j2 + scale * 2,
+                                                              base + j2 + scale * 3};
+                                std::array<u32 *, 4> dt = {data_a + get_cum_shift(i + 0 * sz_it + j1, (cum_ind[0] >> 2) + shf),
+                                                           data_a + get_cum_shift(i + 1 * sz_it + j1, (cum_ind[1] >> 2) + shf),
+                                                           data_a + get_cum_shift(i + 2 * sz_it + j1, (cum_ind[2] >> 2) + shf),
+                                                           data_a + get_cum_shift(i + 3 * sz_it + j1, (cum_ind[3] >> 2) + shf)};
+                                for (int j = 0; j < BLC; j += 8) {
                                     if (first && i == 0) {
-                                        butterfly_inverse_x4<true>(dt[0], dt[1], dt[2], dt[3],
+                                        butterfly_inverse_x4<true>(dt[0] + j, dt[1] + j, dt[2] + j, dt[3] + j,
                                                                    w_1, w1, w2, w3, mts);
                                     } else {
-                                        butterfly_inverse_x4(dt[0], dt[1], dt[2], dt[3],
+                                        butterfly_inverse_x4(dt[0] + j, dt[1] + j, dt[2] + j, dt[3] + j,
                                                              w_1, w1, w2, w3, mts);
                                     }
                                 }
@@ -806,7 +908,7 @@ struct NTT {
         intt(lg, a, mt.r2);
     }
 
-    // a and b should be 32-byte aligned
+    // a and b should be 64-byte aligned
     // writes (a * b) to a
     [[gnu::noinline]] __attribute__((optimize("O3"))) void convolve2(int lg, u32 *__restrict__ a, u32 *__restrict__ b) const {
         if (lg <= MUL_QUAD) {
@@ -862,15 +964,41 @@ struct NTT {
         int sz = std::max(0, (int)a.size() + (int)b.size() - 1);
 
         int lg = std::__lg(std::max(1, sz - 1)) + 1;
-        u32 *ap = (u32 *)_mm_malloc(std::max(32, (1 << lg) * 4), 32);
-        u32 *bp = (u32 *)_mm_malloc(std::max(32, (1 << lg) * 4), 32);
+        u32 *ap = (u32 *)_mm_malloc(std::max(64, (1 << lg) * 4), 64);
+        u32 *bp = (u32 *)_mm_malloc(std::max(64, (1 << lg) * 4), 64);
         memset(ap, 0, 4 << lg);
         memset(bp, 0, 4 << lg);
 
         std::copy(a.begin(), a.end(), ap);
         std::copy(b.begin(), b.end(), bp);
 
+        const int cnt = (lg - PG_SZ) / HRD_RD;
+        if (cnt > 0)
+            for (int i = 0; i < (1 << HRD_RD * cnt); i++) {
+                int shf = 0;
+                for (int j = 0; j < cnt; j++) {
+                    shf += (i >> HRD_RD * j + 2);
+                }
+                shf &= (BLC_CNT - 1);
+                for (int j = i * (1 << lg - cnt * HRD_RD); j < (i + 1) * (1 << lg - cnt * HRD_RD); j += (1 << PG_SZ)) {
+                    std::rotate(ap + j, ap + j + (1 << PG_SZ) - shf * BLC_SZ, ap + j + (1 << PG_SZ));
+                    std::rotate(bp + j, bp + j + (1 << PG_SZ) - shf * BLC_SZ, bp + j + (1 << PG_SZ));
+                }
+            }
+
         convolve2(lg, ap, bp);
+
+        if (cnt > 0)
+            for (int i = 0; i < (1 << HRD_RD * cnt); i++) {
+                int shf = 0;
+                for (int j = 0; j < cnt; j++) {
+                    shf += (i >> HRD_RD * j + 2);
+                }
+                shf &= (BLC_CNT - 1);
+                for (int j = i * (1 << lg - cnt * HRD_RD); j < (i + 1) * (1 << lg - cnt * HRD_RD); j += (1 << PG_SZ)) {
+                    std::rotate(ap + j, ap + j + shf * BLC_SZ, ap + j + (1 << PG_SZ));
+                }
+            }
 
         std::vector<u32> res(ap, ap + sz);
         _mm_free(ap);
